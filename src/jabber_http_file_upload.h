@@ -11,6 +11,7 @@ typedef struct _HFUXfer {
     JabberStream *js;
     HFUJabberStreamData *js_data;
     PurpleSslConnection *ssl_conn;
+    int conn;
     gchar *put_url;
     gchar *get_url;
     GHashTable *put_headers;

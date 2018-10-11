@@ -34,12 +34,20 @@ typedef struct {
     gchar *path;
     gchar *user;
     gchar *passwd;
+    gboolean secure;
 } PurpleHttpURL;
 
 
 static inline PurpleHttpURL *purple_http_url_parse(const gchar *url) {
     PurpleHttpURL *ret = g_new0(PurpleHttpURL, 1);
     purple_url_parse(url, &(ret->host), &(ret->port), &(ret->path), &(ret->user), &(ret->passwd));
+    purple_debug_info("jabber_http_upload", "url [4] %c\n", url[4]);
+    if (url[4] == 's') {
+        ret->secure = TRUE;
+    } else {
+        ret->secure = FALSE;
+    }
+    purple_debug_info("jabber_http_upload", "secure %i\n", ret->secure);
     return ret;
 }
 
@@ -52,7 +60,7 @@ static inline void purple_http_url_free(PurpleHttpURL *phl) { g_free(phl->host);
 #define JABBER_PLUGIN_ID "prpl-jabber"
 
 
-static void jabber_hfu_http_read(gpointer user_data, PurpleSslConnection *ssl_connection, PurpleInputCondition cond)
+static void jabber_hfu_https_read(gpointer user_data, PurpleSslConnection *ssl_connection, PurpleInputCondition cond)
 {
     gchar buf[1024];
 
@@ -61,7 +69,16 @@ static void jabber_hfu_http_read(gpointer user_data, PurpleSslConnection *ssl_co
     purple_debug_info("jabber_http_upload", "Server file send response was %s\n", buf);
 }
 
-static void jabber_hfu_http_send_connect_cb(gpointer data, PurpleSslConnection *ssl_connection, PurpleInputCondition cond)
+static void jabber_hfu_http_read(gpointer user_data, int connection, PurpleInputCondition cond)
+{
+    gchar buf[1024];
+
+    //Flush the server buffer
+    /*read(connection, buf, 1024);  FIXME */
+    purple_debug_info("jabber_http_upload", "Server file send insecure response was %s\n", buf);
+}
+
+static void jabber_hfu_https_send_connect_cb(gpointer data, PurpleSslConnection *ssl_connection, PurpleInputCondition cond)
 {
     PurpleHttpURL *httpurl;
     gchar *headers, *host, *path;
@@ -77,8 +94,8 @@ static void jabber_hfu_http_send_connect_cb(gpointer data, PurpleSslConnection *
         host = g_hash_table_lookup(hfux->put_headers, "Host") ?: purple_http_url_get_host(httpurl);
     else
         host = purple_http_url_get_host(httpurl);
-    
- 
+
+
     headers = g_strdup_printf("PUT /%s HTTP/1.0\r\n"
             "Connection: close\r\n"
             "Host: %s\r\n"
@@ -95,7 +112,7 @@ static void jabber_hfu_http_send_connect_cb(gpointer data, PurpleSslConnection *
     purple_ssl_write(ssl_connection, headers, strlen(headers));
 
     hfux->ssl_conn = ssl_connection;
-    purple_ssl_input_add(ssl_connection, jabber_hfu_http_read, xfer);
+    purple_ssl_input_add(ssl_connection, jabber_hfu_https_read, xfer);
 
     purple_xfer_ref(xfer);
     purple_xfer_start(xfer, ssl_connection->fd, NULL, 0);
@@ -106,9 +123,53 @@ static void jabber_hfu_http_send_connect_cb(gpointer data, PurpleSslConnection *
 
 }
 
-static void jabber_hfu_http_error_connect_cb(PurpleSslConnection *ssl_connection, PurpleSslErrorType *error_type, gpointer data)
+static void jabber_hfu_https_error_connect_cb(PurpleSslConnection *ssl_connection, PurpleSslErrorType *error_type, gpointer data)
 {
     purple_debug_info("jabber_http_upload", "SSL error\n");
+}
+
+static void jabber_hfu_http_send_connect_cb(gpointer data, int source, const gchar *error_message)
+{
+    PurpleHttpURL *httpurl;
+    gchar *headers, *host, *path;
+
+    PurpleXfer *xfer = data;
+    HFUXfer *hfux = purple_xfer_get_protocol_data(xfer);
+    HFUJabberStreamData *js_data = hfux->js_data;
+
+    httpurl = purple_http_url_parse(hfux->put_url);
+    path = purple_http_url_get_path(httpurl);
+
+    if (str_equal(js_data->ns, NS_HTTP_FILE_UPLOAD_V0))
+        host = g_hash_table_lookup(hfux->put_headers, "Host") ?: purple_http_url_get_host(httpurl);
+    else
+        host = purple_http_url_get_host(httpurl);
+
+
+    headers = g_strdup_printf("PUT /%s HTTP/1.0\r\n"
+            "Connection: close\r\n"
+            "Host: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "User-Agent: libpurple\r\n"
+            "\r\n",
+            path,
+            host,
+            purple_xfer_get_size(xfer));
+
+    //add headers!!! WHY???
+
+    /* send(source, headers, strlen(headers)); FIXME */
+
+    hfux->conn = source; /* FIXME? */
+    purple_input_add(source, PURPLE_INPUT_READ, jabber_hfu_http_read, xfer); /* FIXME? */
+
+    purple_xfer_ref(xfer);
+    purple_xfer_start(xfer, source, NULL, 0);
+
+    purple_xfer_prpl_ready(xfer);
+
+    g_free(headers);
 }
 
 static void jabber_hfu_request_cb(JabberStream *js, const char *from,
@@ -155,7 +216,16 @@ static void jabber_hfu_request_cb(JabberStream *js, const char *from,
     put_httpurl = purple_http_url_parse(hfux->put_url);
     put_host = purple_http_url_get_host(put_httpurl);
 
-    purple_ssl_connect(account, put_host, purple_http_url_get_port(put_httpurl), jabber_hfu_http_send_connect_cb, (PurpleSslErrorFunction)jabber_hfu_http_error_connect_cb, xfer);
+    /* XEP-0363 Version 0.7.0 (2018-05-30) says: "The host MUST provide
+     * Transport Layer Security", but older versions don't.
+     * Some servers do not provide TLS.
+     */
+    if (put_httpurl->secure) {
+        purple_ssl_connect(account, put_host, purple_http_url_get_port(put_httpurl), jabber_hfu_https_send_connect_cb, (PurpleSslErrorFunction)jabber_hfu_https_error_connect_cb, xfer);
+    } else {
+        purple_debug_info("jabber_http_upload", "insecure put_httpurl %s\n", hfux->put_url);
+        purple_proxy_connect(NULL, account, put_host, purple_http_url_get_port(put_httpurl), jabber_hfu_http_send_connect_cb, xfer);
+    }
 
     purple_http_url_free(put_httpurl);
 }
@@ -180,6 +250,7 @@ static void jabber_hfu_xfer_free(PurpleXfer *xfer)
     {
         purple_ssl_close(hfux->ssl_conn);
     }
+    /* FIXME close non-ssl connection */
 
 
     g_free(hfux);
@@ -297,7 +368,9 @@ static gssize jabber_hfu_xfer_write(const guchar *buffer, size_t len, PurpleXfer
 
     HFUXfer *hfux = purple_xfer_get_protocol_data(xfer);
 
+    /* FIXME if secure this */
     tlen = purple_ssl_write(hfux->ssl_conn, buffer, len);
+    /* else something else */
 
     if (tlen == -1) 
     {
